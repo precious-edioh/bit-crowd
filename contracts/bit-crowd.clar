@@ -174,3 +174,180 @@
     voter: voter,
   })
 )
+
+;; INTERNAL UTILITIES
+
+;; Validate string input integrity
+(define-private (is-valid-string (input (string-ascii 256)))
+  (let ((length (len input)))
+    (and
+      (> length u0)
+      (<= length u256)
+      ;; Additional validation logic can be implemented here
+      true
+    )
+  )
+)
+
+;; Validate campaign ID within system bounds
+(define-private (is-valid-campaign-id (campaign-id uint))
+  (and
+    (> campaign-id u0)
+    (<= campaign-id MAX_CAMPAIGN_ID)
+  )
+)
+
+;; Manage contributor list registration
+(define-private (add-contributor-to-list
+    (campaign-id uint)
+    (contributor principal)
+  )
+  (let ((current-list (default-to (list)
+      (get contributor-list
+        (map-get? campaign-contributors { campaign-id: campaign-id })
+      ))))
+    (if (< (len current-list) u500)
+      (begin
+        (map-set campaign-contributors { campaign-id: campaign-id } { 
+          contributor-list: (unwrap! (as-max-len? (append current-list contributor) u500)
+            ERR_CONTRIBUTOR_LIST_FULL
+          ) 
+        })
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Automated campaign status lifecycle management
+(define-private (update-campaign-status (campaign-id uint))
+  (match (get-campaign campaign-id)
+    campaign (begin
+      (if (>= stacks-block-height (get deadline-height campaign))
+        (if (>= (get raised campaign) (get goal campaign))
+          (map-set campaigns { campaign-id: campaign-id }
+            (merge campaign { status: STATUS_SUCCESSFUL })
+          )
+          (map-set campaigns { campaign-id: campaign-id }
+            (merge campaign { status: STATUS_FAILED })
+          )
+        )
+        true
+      )
+      true
+    )
+    false
+  )
+)
+
+;; CORE PUBLIC FUNCTIONS
+
+;; Launch new crowdfunding campaign
+(define-public (create-campaign
+    (title (string-ascii 64))
+    (description (string-ascii 256))
+    (goal uint)
+    (duration-blocks uint)
+    (voting-enabled bool)
+    (voting-duration-blocks uint)
+    (min-contribution uint)
+  )
+  (let (
+      (campaign-id (+ (var-get campaign-counter) u1))
+      (deadline-height (+ stacks-block-height duration-blocks))
+      (validated-voting-duration (if voting-enabled
+        (begin
+          (asserts! (<= voting-duration-blocks MAX_VOTING_DURATION_BLOCKS)
+            ERR_INVALID_PARAMETERS
+          )
+          voting-duration-blocks
+        )
+        u0
+      ))
+      (voting-deadline (if voting-enabled
+        (+ deadline-height validated-voting-duration)
+        deadline-height
+      ))
+    )
+    ;; Input validation and sanitization
+    (asserts!
+      (is-valid-string (unwrap! (as-max-len? title u64) ERR_INVALID_STRING))
+      ERR_INVALID_STRING
+    )
+    (asserts! (is-valid-string description) ERR_INVALID_STRING)
+    (asserts! (> goal u0) ERR_INVALID_PARAMETERS)
+    (asserts! (>= duration-blocks MIN_DURATION_BLOCKS) ERR_INVALID_PARAMETERS)
+    (asserts! (<= duration-blocks MAX_DURATION_BLOCKS) ERR_INVALID_PARAMETERS)
+    (asserts! (> min-contribution u0) ERR_INVALID_PARAMETERS)
+    
+    ;; Initialize campaign in registry
+    (map-set campaigns { campaign-id: campaign-id } {
+      creator: tx-sender,
+      title: (unwrap! (as-max-len? title u64) ERR_INVALID_STRING),
+      description: description,
+      goal: goal,
+      raised: u0,
+      deadline-height: deadline-height,
+      created-height: stacks-block-height,
+      status: STATUS_ACTIVE,
+      voting-enabled: voting-enabled,
+      voting-deadline-height: voting-deadline,
+      votes-for: u0,
+      votes-against: u0,
+      min-contribution: min-contribution,
+    })
+    
+    (var-set campaign-counter campaign-id)
+    (ok campaign-id)
+  )
+)
+
+;; Process contributor investment with escrow
+(define-public (contribute
+    (campaign-id uint)
+    (amount uint)
+  )
+  (let (
+      (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+      (existing-contribution (default-to {
+        amount: u0,
+        refunded: false,
+        voting-power: u0,
+      }
+        (get-contribution campaign-id tx-sender)
+      ))
+      (new-amount (+ (get amount existing-contribution) amount))
+      (voting-power (if (get voting-enabled campaign)
+        amount
+        u0
+      ))
+    )
+    ;; Contribution validation
+    (asserts! (is-valid-campaign-id campaign-id) ERR_INVALID_PARAMETERS)
+    (asserts! (is-campaign-active campaign-id) ERR_CAMPAIGN_ENDED)
+    (asserts! (>= amount (get min-contribution campaign)) ERR_INVALID_AMOUNT)
+    
+    ;; Execute secure STX transfer to escrow
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update contributor investment record
+    (map-set contributions {
+      campaign-id: campaign-id,
+      contributor: tx-sender,
+    } {
+      amount: new-amount,
+      refunded: false,
+      voting-power: (+ (get voting-power existing-contribution) voting-power),
+    })
+    
+    ;; Update campaign funding metrics
+    (map-set campaigns { campaign-id: campaign-id }
+      (merge campaign { raised: (+ (get raised campaign) amount) })
+    )
+    
+    ;; Register contributor in campaign stakeholder list
+    (try! (add-contributor-to-list campaign-id tx-sender))
+    (ok true)
+  )
+)
